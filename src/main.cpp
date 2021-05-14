@@ -13,31 +13,45 @@ using namespace llvm;
 
 // Apply a custom category to all command-line options so that they are the
 // only ones displayed.
-static cl::OptionCategory MyToolCategory("c2julia options");
+static llvm::cl::OptionCategory MyToolCategory("c2julia options");
 
 // CommonOptionsParser declares HelpMessage with a description of the common
 // command-line options related to the compilation database and input files.
 // It's nice to have this help message in all tools.
-static cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
+static llvm::cl::extrahelp CommonHelp(CommonOptionsParser::HelpMessage);
 
 // A help message for this specific tool can be added afterwards.
-static cl::extrahelp MoreHelp("\nMore help text...\n");
+static llvm::cl::extrahelp MoreHelp("\nMore help text...\n");
 
+// A visitor to leverage the dispatcher of RecursiveASTVisitor
+// But I need to manually call traverse so that I do not have to
+// manage context explicitly, so most of these visitor functions
+// return false to terminate the traverse process. I.e, Only the
+// dispatcher is used.
+// Everything is just dumped to stdout for this moment.
 class C2JuliaVisitor : public RecursiveASTVisitor<C2JuliaVisitor> {
 public:
   explicit C2JuliaVisitor(ASTContext *Context) : Context(Context) {}
 
-  bool VisitFunctionDecl(FunctionDecl *d) {
-    if (isMainFile(d)) {
-      llvm::outs() << d->getName() << '\n';
-      auto &&params = d->parameters();
-      for (auto &&p : params) {
-        llvm::outs() << '\t' << p->getName()
-                     << "::" << p->getOriginalType().getAsString() << '\n';
-      }
-    }
+  auto &&outs() { return llvm::outs(); }
 
-    return true;
+  bool VisitFunctionDecl(FunctionDecl *d) {
+    if (!isMainFile(d))
+      return false;
+
+    outs() << "function " << d->getName() << '(';
+    bool first = true;
+    for (auto p : d->parameters()) {
+      if (!first) outs() << ", ";
+      first = false;
+      outs() << p->getName() << "::" << p->getOriginalType().getAsString();
+    }
+    outs() << ")\n";
+
+    TraverseDecl(d);
+
+    outs() << "end\n";
+    return false;
   }
 
   bool isMainFile(Decl *d) {
@@ -55,7 +69,9 @@ public:
   explicit C2JuliaConsumer(ASTContext *Context) : Visitor(Context) {}
 
   virtual void HandleTranslationUnit(clang::ASTContext &Context) {
-    Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+    for (Decl *D : Context.getTranslationUnitDecl()->decls()) {
+      Visitor.TraverseDecl(D);
+    }
   }
 
 private:
