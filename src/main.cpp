@@ -1,5 +1,6 @@
 #include "clang/AST/ASTConsumer.h"
-#include "clang/AST/RecursiveASTVisitor.h"
+#include "clang/AST/DeclVisitor.h"
+#include "clang/AST/StmtVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/FrontendActions.h"
@@ -29,32 +30,163 @@ static llvm::cl::extrahelp MoreHelp("\nMore help text...\n");
 // return false to terminate the traverse process. I.e, Only the
 // dispatcher is used.
 // Everything is just dumped to stdout for this moment.
-class C2JuliaVisitor : public RecursiveASTVisitor<C2JuliaVisitor> {
+class C2JuliaVisitor : public ConstStmtVisitor<C2JuliaVisitor>,
+                       public ConstDeclVisitor<C2JuliaVisitor> {
 public:
   explicit C2JuliaVisitor(ASTContext *Context) : Context(Context) {}
 
   auto &&outs() { return llvm::outs(); }
+  auto &&errs() { return llvm::errs(); }
 
-  bool VisitFunctionDecl(FunctionDecl *d) {
+  // Expose shadowed methods
+  void Visit(const Decl *d) {
+    return ConstDeclVisitor<C2JuliaVisitor>::Visit(d);
+  }
+  void Visit(const Stmt *s) {
+    return ConstStmtVisitor<C2JuliaVisitor>::Visit(s);
+  }
+
+  void VisitDecl(const Decl *d) {
     if (!isMainFile(d))
-      return false;
+      return;
+    errs() << d->getDeclKindName() << "Decl is not implemented.\n";
+    d->dump(errs());
+  }
+  void VisitStmt(const Stmt *s) {
+    errs() << s->getStmtClassName() << " is not implemented.\n";
+    s->dump(errs(), *Context);
+  }
+
+  void VisitFunctionDecl(const FunctionDecl *d) {
+    if (!isMainFile(d))
+      return;
 
     outs() << "function " << d->getName() << '(';
     bool first = true;
     for (auto p : d->parameters()) {
-      if (!first) outs() << ", ";
+      if (!first)
+        outs() << ", ";
       first = false;
+      // TODO: Use real types
       outs() << p->getName() << "::" << p->getOriginalType().getAsString();
     }
     outs() << ")\n";
 
-    TraverseDecl(d);
+    if (const Stmt *b = d->getBody()) {
+      for (const Stmt *c : b->children()) {
+        Visit(c);
+      }
+    }
 
     outs() << "end\n";
-    return false;
+    return;
   }
 
-  bool isMainFile(Decl *d) {
+  void VisitCompoundStmt(const CompoundStmt *s) {
+    // The case where a CompoundStmt is actually just a container will be
+    // handled explicitly in respective methods for its parent type.
+    outs() << "let\n";
+    for (const Stmt *c : s->children()) {
+      Visit(c);
+      outs() << "\n";
+    }
+    outs() << "end\n";
+  }
+
+  void VisitDeclStmt(const DeclStmt *s) {
+    for (const Decl *c : s->decls()) {
+      Visit(c);
+    }
+  }
+
+  void VisitVarDecl(const VarDecl *d) {
+    outs() << d->getName();
+    if (d->hasInit()) {
+      outs() << " = ";
+      Visit(d->getInit());
+    }
+    if (d->isEscapingByref()) {
+      errs() << d->getName() << " is escapeing by ref.\n";
+    }
+  }
+
+  void VisitImplicitCastExpr(const ImplicitCastExpr *e) {
+    // Unfortunately, StmtVisitor does not handle cast expressions. So I handle
+    // them explicitly.
+    llvm::SmallString<32> after;
+    switch (e->getCastKind()) {
+    case CK_LValueToRValue:
+      // Ignore
+      break;
+
+    case CK_IntegralCast:
+      outs() << "(";
+      after = " % C";
+      if (e->getType()->isSignedIntegerType()) {
+        after += "u";
+      }
+      // TODO: Is this safe?
+      after += e->getType().getAsString();
+      after += ")";
+      break;
+
+    default:
+      errs() << "Unhandled cast kind: " << e->getCastKindName() << "\n";
+    }
+    Visit(e->getSubExpr());
+    outs() << after;
+  }
+
+  void VisitUnaryOperator(const UnaryOperator *o) {
+    auto opname = UnaryOperator::getOpcodeStr(o->getOpcode());
+    llvm::SmallString<16> after;
+    switch (o->getOpcode()) {
+    case UO_PreInc:
+      outs() << "(";
+      after = " += 1)";
+      break;
+    case UO_PreDec:
+      outs() << "(";
+      after = " -= 1)";
+      break;
+    case UO_PostInc:
+      outs() << "(@post_inc ";
+      after = ")";
+      break;
+    case UO_PostDec:
+      outs() << "(@post_dec ";
+      after = ")";
+      break;
+    case UO_Deref:
+      after = "[]";
+      break;
+    // case UO_AddrOf:
+    //   // Not handled
+    //   break;
+    case UO_LNot:
+    case UO_Not:
+    case UO_Minus:
+    case UO_Plus:
+      outs() << opname;
+      break;
+    default:
+      errs() << "Unhandled unary operator: " << opname << "\n";
+    }
+    Visit(o->getSubExpr());
+    outs() << after;
+  }
+
+  // void VisitDeclRefExpr(const DeclRefExpr *e) {
+
+  // }
+
+  void Visit(const ASTContext *ctx) {
+    for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
+      Visit(d);
+    }
+  }
+
+  bool isMainFile(const Decl *d) {
     auto &&mgr = Context->getSourceManager();
     auto entry = mgr.getFileEntryForID(mgr.getFileID(d->getLocation()));
     return entry && mgr.isMainFile(*entry);
@@ -68,10 +200,8 @@ class C2JuliaConsumer : public clang::ASTConsumer {
 public:
   explicit C2JuliaConsumer(ASTContext *Context) : Visitor(Context) {}
 
-  virtual void HandleTranslationUnit(clang::ASTContext &Context) {
-    for (Decl *D : Context.getTranslationUnitDecl()->decls()) {
-      Visitor.TraverseDecl(D);
-    }
+  void HandleTranslationUnit(clang::ASTContext &Context) override {
+    Visitor.Visit(&Context);
   }
 
 private:
