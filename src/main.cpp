@@ -1,5 +1,6 @@
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/DeclVisitor.h"
+#include "clang/AST/RecursiveASTVisitor.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/FrontendAction.h"
@@ -176,9 +177,33 @@ public:
     outs() << after;
   }
 
-  // void VisitDeclRefExpr(const DeclRefExpr *e) {
+  void VisitUnaryAddrOf(const UnaryOperator *o) {
+    auto *ref = dyn_cast<DeclRefExpr>(o->getSubExpr());
+    if (!ref) {
+      errs() << "Subexpression of & must be a reference to a variable\n";
+      abort();
+    }
+    auto *decl = dyn_cast<VarDecl>(ref->getDecl());
+    if (decl) {
+      if (decl->isEscapingByref()) {
+        // This is the special case, do not call Visit
+        // Visit(decl);
+        outs() << decl->getName();
+      } else {
+        errs() << "A use of & operator is not analysed.\n";
+      }
+    } else {
+      errs() << "Subexpression of & must be a reference to a variable\n";
+      abort();
+    }
+  }
 
-  // }
+  void VisitDeclRefExpr(const DeclRefExpr *e) {
+    outs() << e->getDecl()->getName();
+    auto *decl = dyn_cast<VarDecl>(e->getDecl());
+    if (decl && decl->isEscapingByref())
+      outs() << "[]";
+  }
 
   void Visit(const ASTContext *ctx) {
     for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
@@ -196,11 +221,35 @@ private:
   ASTContext *Context;
 };
 
+// I must know in advance whether a local variable "leaks" by pointers. Instead
+// of building external dictionaries, maybe I could reuse a few bits in the Decl
+// type.
+class ReferenceMarker : public clang::RecursiveASTVisitor<ReferenceMarker> {
+public:
+  bool VisitDeclRefExpr(DeclRefExpr *e) {
+    VarDecl *d = dyn_cast<VarDecl>(e->getDecl());
+    if (!d) {
+      llvm::errs() << e->getDecl()->getName() << " is not a VarDecl.\n";
+      return true;
+    }
+    if (d->isEscapingByref()) {
+      llvm::errs() << d->getName() << "'s attribute isEscapingByUse is true!\n";
+      abort();
+      return true;
+    }
+    d->setEscapingByref();
+    llvm::outs() << d->getName() << " is escaping by ref: " << d->isEscapingByref() << '\n';
+    return true;
+  }
+};
+
 class C2JuliaConsumer : public clang::ASTConsumer {
 public:
   explicit C2JuliaConsumer(ASTContext *Context) : Visitor(Context) {}
 
   void HandleTranslationUnit(clang::ASTContext &Context) override {
+    ReferenceMarker rm;
+    rm.TraverseAST(Context);
     Visitor.Visit(&Context);
   }
 
