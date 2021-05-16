@@ -34,7 +34,8 @@ static llvm::cl::extrahelp MoreHelp("\nMore help text...\n");
 class C2JuliaVisitor : public ConstStmtVisitor<C2JuliaVisitor>,
                        public ConstDeclVisitor<C2JuliaVisitor> {
 public:
-  explicit C2JuliaVisitor(ASTContext *Context) : Context(Context) {}
+  explicit C2JuliaVisitor(ASTContext *Context)
+      : Context(Context), EscapingSet(), isAddrOf(false) {}
 
   auto &&outs() { return llvm::outs(); }
   auto &&errs() { return llvm::errs(); }
@@ -68,14 +69,14 @@ public:
       if (!first)
         outs() << ", ";
       first = false;
-      // TODO: Use real types
-      outs() << p->getName() << "::" << p->getOriginalType().getAsString();
+      outs() << p->getName() << "::" << getTypeName(p->getOriginalType());
     }
     outs() << ")\n";
 
     if (const Stmt *b = d->getBody()) {
       for (const Stmt *c : b->children()) {
         Visit(c);
+        outs() << "\n";
       }
     }
 
@@ -101,13 +102,21 @@ public:
   }
 
   void VisitVarDecl(const VarDecl *d) {
-    outs() << d->getName();
-    if (d->hasInit()) {
-      outs() << " = ";
-      Visit(d->getInit());
-    }
-    if (d->isEscapingByref()) {
-      errs() << d->getName() << " is escapeing by ref.\n";
+    if (inRefSet(d)) {
+      outs() << d->getName() << " = Ref{";
+      outs() << getTypeName(d->getType());
+      outs() << "}()\n";
+      if (d->hasInit()) {
+        outs() << d->getName() << "[] = ";
+        Visit(d->getInit());
+      }
+    } else {
+      outs() << d->getName() << " = ";
+      if (d->hasInit()) {
+        Visit(d->getInit());
+      } else {
+        outs() << "undef";
+      }
     }
   }
 
@@ -122,12 +131,8 @@ public:
 
     case CK_IntegralCast:
       outs() << "(";
-      after = " % C";
-      if (e->getType()->isSignedIntegerType()) {
-        after += "u";
-      }
-      // TODO: Is this safe?
-      after += e->getType().getAsString();
+      after = " % ";
+      after += getTypeName(e->getType());
       after += ")";
       break;
 
@@ -162,7 +167,7 @@ public:
       after = "[]";
       break;
     // case UO_AddrOf:
-    //   // Not handled
+    //   // See VisitUnaryAddrOf
     //   break;
     case UO_LNot:
     case UO_Not:
@@ -183,25 +188,15 @@ public:
       errs() << "Subexpression of & must be a reference to a variable\n";
       abort();
     }
-    auto *decl = dyn_cast<VarDecl>(ref->getDecl());
-    if (decl) {
-      if (decl->isEscapingByref()) {
-        // This is the special case, do not call Visit
-        // Visit(decl);
-        outs() << decl->getName();
-      } else {
-        errs() << "A use of & operator is not analysed.\n";
-      }
-    } else {
-      errs() << "Subexpression of & must be a reference to a variable\n";
-      abort();
-    }
+    isAddrOf = true;
+    VisitDeclRefExpr(ref);
+    isAddrOf = false;
   }
 
   void VisitDeclRefExpr(const DeclRefExpr *e) {
-    outs() << e->getDecl()->getName();
-    auto *decl = dyn_cast<VarDecl>(e->getDecl());
-    if (decl && decl->isEscapingByref())
+    auto *decl = e->getDecl();
+    outs() << decl->getName();
+    if (!isAddrOf && inRefSet(decl))
       outs() << "[]";
   }
 
@@ -211,14 +206,42 @@ public:
     }
   }
 
-  bool isMainFile(const Decl *d) {
+  bool isMainFile(const Decl *d) const {
     auto &&mgr = Context->getSourceManager();
     auto entry = mgr.getFileEntryForID(mgr.getFileID(d->getLocation()));
     return entry && mgr.isMainFile(*entry);
   }
 
+  auto &getEscapingSet() { return EscapingSet; }
+
+  bool inRefSet(const Decl *d) const {
+    return std::binary_search(EscapingSet.cbegin(), EscapingSet.cend(), d);
+  }
+
+  static std::string getTypeName(const QualType &type){
+    std::string res;
+    
+    if (type->isIntegerType() && type->isBuiltinType()) {
+      res = "C";
+      if (type->isUnsignedIntegerType()) {
+        res += "u";
+      }
+      res += type.getAsString();
+    } else {
+      // TODO: more types
+      res = type.getAsString();
+    }
+
+    return res;
+  }
+
 private:
   ASTContext *Context;
+  // Set of variables escaping by the & operator
+  std::vector<const Decl *> EscapingSet;
+
+  // See VisitUnaryAddrOf
+  bool isAddrOf;
 };
 
 // I must know in advance whether a local variable "leaks" by pointers. Instead
@@ -226,21 +249,27 @@ private:
 // type.
 class ReferenceMarker : public clang::RecursiveASTVisitor<ReferenceMarker> {
 public:
-  bool VisitDeclRefExpr(DeclRefExpr *e) {
-    VarDecl *d = dyn_cast<VarDecl>(e->getDecl());
-    if (!d) {
-      llvm::errs() << e->getDecl()->getName() << " is not a VarDecl.\n";
-      return true;
+  ReferenceMarker(std::vector<const Decl *> &rs) : RefSet(rs) {}
+
+  bool VisitUnaryOperator(UnaryOperator *o) {
+    if (o->getOpcode() == UO_AddrOf) {
+      // TODO: what are the posible subexpressions?
+      auto *ref = dyn_cast<DeclRefExpr>(o->getSubExpr());
+      if (ref) {
+        RefSet.push_back(ref->getDecl());
+      }
     }
-    if (d->isEscapingByref()) {
-      llvm::errs() << d->getName() << "'s attribute isEscapingByUse is true!\n";
-      abort();
-      return true;
-    }
-    d->setEscapingByref();
-    llvm::outs() << d->getName() << " is escaping by ref: " << d->isEscapingByref() << '\n';
     return true;
   }
+
+  void sortRefSet() {
+    std::sort(RefSet.begin(), RefSet.end());
+    auto end = std::unique(RefSet.begin(), RefSet.end());
+    RefSet.resize(end - RefSet.begin());
+  }
+
+private:
+  std::vector<const Decl *> &RefSet;
 };
 
 class C2JuliaConsumer : public clang::ASTConsumer {
@@ -248,8 +277,11 @@ public:
   explicit C2JuliaConsumer(ASTContext *Context) : Visitor(Context) {}
 
   void HandleTranslationUnit(clang::ASTContext &Context) override {
-    ReferenceMarker rm;
+    auto &rs = Visitor.getEscapingSet();
+    ReferenceMarker rm(rs);
     rm.TraverseAST(Context);
+    rm.sortRefSet();
+
     Visitor.Visit(&Context);
   }
 
