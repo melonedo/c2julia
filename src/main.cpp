@@ -115,7 +115,7 @@ public:
       if (d->hasInit()) {
         Visit(d->getInit());
       } else {
-        outs() << "undef";
+        outs() << "nothing";
       }
     }
   }
@@ -126,6 +126,8 @@ public:
     llvm::SmallString<32> after;
     switch (e->getCastKind()) {
     case CK_LValueToRValue:
+    case CK_NoOp:
+    case CK_ArrayToPointerDecay:
       // Ignore
       break;
 
@@ -136,6 +138,10 @@ public:
       after += ")";
       break;
 
+    case CK_BitCast:
+      if (e->getType()->isPointerType()) {
+        break;
+      }
     default:
       errs() << "Unhandled cast kind: " << e->getCastKindName() << "\n";
     }
@@ -156,11 +162,11 @@ public:
       after = " -= 1)";
       break;
     case UO_PostInc:
-      outs() << "(@post_inc ";
+      outs() << "@post_inc(";
       after = ")";
       break;
     case UO_PostDec:
-      outs() << "(@post_dec ";
+      outs() << "@post_dec(";
       after = ")";
       break;
     case UO_Deref:
@@ -183,14 +189,32 @@ public:
   }
 
   void VisitUnaryAddrOf(const UnaryOperator *o) {
-    auto *ref = dyn_cast<DeclRefExpr>(o->getSubExpr());
-    if (!ref) {
-      errs() << "Subexpression of & must be a reference to a variable\n";
-      abort();
+    auto *subexpr = o->getSubExpr();
+    auto *ref = dyn_cast<DeclRefExpr>(subexpr);
+    if (ref) {
+      isAddrOf = true;
+      VisitDeclRefExpr(ref);
+      isAddrOf = false;
+      return;
+    } else if (auto *memref = dyn_cast<MemberExpr>(subexpr)) {
+      outs() << "@pointer(";
+      VisitMemberExpr(memref);
+      outs() << ")";
+      return;
+    } else if (auto *arrayref = dyn_cast<ArraySubscriptExpr>(subexpr)) {
+      outs() << "@pointer(";
+      VisitArraySubscriptExpr(arrayref);
+      outs() << ")";
+      return;
     }
-    isAddrOf = true;
-    VisitDeclRefExpr(ref);
-    isAddrOf = false;
+    errs() << "Subexpression of & must be a reference to a variable\n";
+    o->dump();
+    abort();
+  }
+
+  void VisitMemberExpr(const MemberExpr *e) {
+    Visit(e->getBase());
+    outs() << "." << e->getMemberDecl()->getName();
   }
 
   void VisitDeclRefExpr(const DeclRefExpr *e) {
@@ -199,6 +223,142 @@ public:
     if (!isAddrOf && inRefSet(decl))
       outs() << "[]";
   }
+
+  void VisitCompoundAssignOperator(const CompoundAssignOperator *o) {
+    auto lhs = o->getLHS();
+    auto rhs = o->getRHS();
+    auto type = lhs->getType();
+    std::string typeName;
+    if (!type->isPointerType()) {
+      typeName = getTypeName(type);
+    }
+
+    auto op = BinaryOperator::getOpcodeStr(o->getOpcode());
+    // We need to make sure the types match the assigned-to (left) operand.
+    //! TODO: Use less type conversions
+    Visit(lhs);
+    outs() << " " << op << " " << typeName << "(";
+    Visit(rhs);
+    outs() << ")";
+  }
+
+  void VisitBinaryOperator(const BinaryOperator *o) {
+    auto op = BinaryOperator::getOpcodeStr(o->getOpcode());
+    outs() << "(";
+    Visit(o->getLHS());
+    outs() << ")" << op << "(";
+    Visit(o->getRHS());
+    outs() << ")";
+  }
+
+  void VisitBinAssign(const BinaryOperator *o) {
+    auto lhs = o->getLHS();
+    auto rhs = o->getRHS();
+    auto type = getTypeName(lhs->getType());
+    auto op = BinaryOperator::getOpcodeStr(o->getOpcode());
+    Visit(lhs);
+    outs() << " " << op << " " << type << "(";
+    Visit(rhs);
+    outs() << ")";
+  }
+
+  void VisitIntegerLiteral(const IntegerLiteral *l) {
+    auto v = l->getValue();
+    outs() << v.toString(10, true);
+  }
+
+  void VisitStringLiteral(const clang::StringLiteral *l) {
+    // outs() << '\"' << l->getString() << '\"';
+    l->outputString(outs());
+  }
+
+  void VisitCharacterLiteral(const CharacterLiteral *l) {
+    outs() << l->getValue();
+  }
+
+  void VisitCallExpr(const CallExpr *e) {
+    if (auto func = e->getDirectCallee()) {
+      outs() << func->getName();
+    } else {
+      // What about (funcarray + 2)(1, 2)
+      outs() << "(";
+      Visit(e->getCallee());
+      outs() << ")";
+    }
+    outs() << "(";
+    for (size_t i = 0; i < e->getNumArgs(); i++) {
+      if (i != 0) {
+        outs() << ", ";
+      }
+      Visit(e->getArg(i));
+    }
+    outs() << ")";
+  }
+
+  void VisitIfStmt(const IfStmt *s) {
+    //! TODO: Unfold if-else
+    outs() << "if ";
+    Visit(s->getCond());
+    outs() << "\n";
+    for (const Stmt *c : s->getThen()->children()) {
+      Visit(c);
+      outs() << "\n";
+    }
+
+    const Stmt *elseclause = s->getElse();
+    while (elseclause) {
+      if (auto *nestedif = dyn_cast<IfStmt>(elseclause)) {
+        outs() << "elseif ";
+        Visit(nestedif->getCond());
+        outs() << "\n";
+        for (const Stmt *c : nestedif->getThen()->children()) {
+          Visit(c);
+          outs() << "\n";
+        }
+        elseclause = nestedif->getElse();
+      } else {
+        outs() << "else\n";
+        for (const Stmt *c : elseclause->children()) {
+          Visit(c);
+          outs() << "\n";
+        }
+        break;
+      }
+    }
+    outs() << "end";
+  }
+
+  void VisitForStmt(const ForStmt *s) {
+    outs() << "@cfor ";
+    Visit(s->getInit());
+    outs() << " ";
+    Visit(s->getCond());
+    outs() << " ";
+    Visit(s->getInc());
+    outs() << " ";
+    Visit(s->getBody());
+  }
+
+  void VisitBreakStmt(const BreakStmt *s) {
+    outs() << "break";
+  }
+
+  void VisitReturnStmt(const ReturnStmt *s) {
+    outs() << "return ";
+    auto *retval = s->getRetValue();
+    if (retval)
+      Visit(s->getRetValue());
+  }
+
+  void VisitArraySubscriptExpr(const ArraySubscriptExpr *e) {
+    Visit(e->getBase());
+    outs() << "[";
+    Visit(e->getIdx());
+    outs() << "]";
+  }
+
+  void VisitParenExpr(const ParenExpr *e) { Visit(e->getSubExpr()); }
+  void VisitCStyleCastExpr(const CStyleCastExpr *e) { Visit(e->getSubExpr()); }
 
   void Visit(const ASTContext *ctx) {
     for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
@@ -218,9 +378,9 @@ public:
     return std::binary_search(EscapingSet.cbegin(), EscapingSet.cend(), d);
   }
 
-  static std::string getTypeName(const QualType &type){
+  static std::string getTypeName(const QualType &type) {
     std::string res;
-    
+
     if (type->isIntegerType() && type->isBuiltinType()) {
       res = "C";
       if (type->isUnsignedIntegerType()) {
