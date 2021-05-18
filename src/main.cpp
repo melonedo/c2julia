@@ -63,15 +63,24 @@ public:
     if (!isMainFile(d))
       return;
 
-    outs() << "function " << d->getName() << '(';
+    outs() << "function " << getEscapedName(d) << '(';
     bool first = true;
     for (auto p : d->parameters()) {
       if (!first)
         outs() << ", ";
       first = false;
-      outs() << p->getName() << "::" << getTypeName(p->getOriginalType());
+      outs() << getEscapedName(p) << "::" << getTypeName(p->getOriginalType());
     }
-    outs() << ")\n";
+    outs() << ")::" << getTypeName(d->getReturnType()) << "\n";
+
+    // Parameters are also local variables
+    for (auto p : d->parameters()) {
+      if (!inRefSet(p))
+        continue;
+      outs() << getEscapedName(p) << " = Ref{";
+      outs() << getTypeName(p->getType()) << "}(";
+      outs() << getEscapedName(p) << ")\n";
+    }
 
     if (const Stmt *b = d->getBody()) {
       for (const Stmt *c : b->children()) {
@@ -92,7 +101,7 @@ public:
       Visit(c);
       outs() << "\n";
     }
-    outs() << "end\n";
+    outs() << "end";
   }
 
   void VisitDeclStmt(const DeclStmt *s) {
@@ -103,15 +112,15 @@ public:
 
   void VisitVarDecl(const VarDecl *d) {
     if (inRefSet(d)) {
-      outs() << d->getName() << " = Ref{";
+      outs() << getEscapedName(d) << " = Ref{";
       outs() << getTypeName(d->getType());
       outs() << "}()\n";
       if (d->hasInit()) {
-        outs() << d->getName() << "[] = ";
+        outs() << getEscapedName(d) << "[] = ";
         Visit(d->getInit());
       }
     } else {
-      outs() << d->getName() << " = ";
+      outs() << getEscapedName(d) << " = ";
       if (d->hasInit()) {
         Visit(d->getInit());
       } else {
@@ -132,16 +141,16 @@ public:
       break;
 
     case CK_IntegralCast:
-      outs() << "(";
       after = " % ";
       after += getTypeName(e->getType());
-      after += ")";
       break;
 
     case CK_BitCast:
       if (e->getType()->isPointerType()) {
-        break;
+        outs() << getTypeName(e->getType()) << "(";
+        after = ")";
       }
+      break;
     default:
       errs() << "Unhandled cast kind: " << e->getCastKindName() << "\n";
     }
@@ -192,6 +201,7 @@ public:
     auto *subexpr = o->getSubExpr();
     auto *ref = dyn_cast<DeclRefExpr>(subexpr);
     if (ref) {
+      // Maybe just incorporate into @pointer?
       isAddrOf = true;
       VisitDeclRefExpr(ref);
       isAddrOf = false;
@@ -214,12 +224,12 @@ public:
 
   void VisitMemberExpr(const MemberExpr *e) {
     Visit(e->getBase());
-    outs() << "." << e->getMemberDecl()->getName();
+    outs() << "." << getEscapedName(e->getMemberDecl());
   }
 
   void VisitDeclRefExpr(const DeclRefExpr *e) {
     auto *decl = e->getDecl();
-    outs() << decl->getName();
+    outs() << getEscapedName(decl);
     if (!isAddrOf && inRefSet(decl))
       outs() << "[]";
   }
@@ -235,11 +245,14 @@ public:
 
     auto op = BinaryOperator::getOpcodeStr(o->getOpcode());
     // We need to make sure the types match the assigned-to (left) operand.
-    //! TODO: Use less type conversions
+    //! TODO: Use less type conversions and check whether there are non-integer
+    //! conversions
+    //! WARNING: a %= 3 (a is unsigned char) will be a %= 3 % UInt8, which is
+    //! incorrect. It must be a = (a % Int(3)) % UInt8.
     Visit(lhs);
-    outs() << " " << op << " " << typeName << "(";
+    outs() << " " << op << "(";
     Visit(rhs);
-    outs() << ")";
+    outs() << ") % " << typeName;
   }
 
   void VisitBinaryOperator(const BinaryOperator *o) {
@@ -256,10 +269,15 @@ public:
     auto rhs = o->getRHS();
     auto type = getTypeName(lhs->getType());
     auto op = BinaryOperator::getOpcodeStr(o->getOpcode());
+    bool sameType =
+        lhs->getType().getCanonicalType() == rhs->getType().getCanonicalType();
     Visit(lhs);
-    outs() << " " << op << " " << type << "(";
+    outs() << " " << op << " ";
+    if (!sameType)
+      outs() << type << "(";
     Visit(rhs);
-    outs() << ")";
+    if (!sameType)
+      outs() << ")";
   }
 
   void VisitIntegerLiteral(const IntegerLiteral *l) {
@@ -278,7 +296,7 @@ public:
 
   void VisitCallExpr(const CallExpr *e) {
     if (auto func = e->getDirectCallee()) {
-      outs() << func->getName();
+      outs() << getEscapedName(func);
     } else {
       // What about (funcarray + 2)(1, 2)
       outs() << "(";
@@ -296,7 +314,6 @@ public:
   }
 
   void VisitIfStmt(const IfStmt *s) {
-    //! TODO: Unfold if-else
     outs() << "if ";
     Visit(s->getCond());
     outs() << "\n";
@@ -339,9 +356,24 @@ public:
     Visit(s->getBody());
   }
 
-  void VisitBreakStmt(const BreakStmt *s) {
-    outs() << "break";
+  void VisitWhileStmt(const WhileStmt *s) {
+    outs() << "while ";
+    Visit(s->getCond());
+    outs() << "\n";
+    auto *body = s->getBody();
+    if (isa<CompoundStmt>(body)) {
+      for (const Stmt *c : body->children()) {
+        Visit(c);
+        outs() << "\n";
+      }
+    } else {
+      Visit(body);
+      outs() << "\n";
+    }
+    outs() << "end";
   }
+
+  void VisitBreakStmt(const BreakStmt *s) { outs() << "break"; }
 
   void VisitReturnStmt(const ReturnStmt *s) {
     outs() << "return ";
@@ -357,12 +389,17 @@ public:
     outs() << "]";
   }
 
+  void VisitUnaryExprOrTypeTraitExpr(const UnaryExprOrTypeTraitExpr *e) {
+    outs() << "sizeof(" << getTypeName(e->getArgumentType()) << ")";
+  }
+
   void VisitParenExpr(const ParenExpr *e) { Visit(e->getSubExpr()); }
   void VisitCStyleCastExpr(const CStyleCastExpr *e) { Visit(e->getSubExpr()); }
 
   void Visit(const ASTContext *ctx) {
     for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
       Visit(d);
+      outs() << "\n";
     }
   }
 
@@ -378,15 +415,32 @@ public:
     return std::binary_search(EscapingSet.cbegin(), EscapingSet.cend(), d);
   }
 
+  SmallString<32> getEscapedName(const NamedDecl *d) {
+    SmallString<32> name;
+    if (JuliaKeywordSet.contains(d->getName())) {
+      name = "__";
+    }
+    name += d->getName();
+    return name;
+  }
+
   static std::string getTypeName(const QualType &type) {
     std::string res;
 
     if (type->isIntegerType() && type->isBuiltinType()) {
-      res = "C";
       if (type->isUnsignedIntegerType()) {
-        res += "u";
+        res = "Cu";
+        res += type.getAsString().substr(sizeof("unsigned"));
+      } else {
+        res = "C";
+        res += type.getAsString();
       }
-      res += type.getAsString();
+    } else if (type->isPointerType()) {
+      res = "Pointer{";
+      res += getTypeName(type->getPointeeType());
+      res += "}";
+    } else if (type->isVoidType()) {
+      res = "Cvoid";
     } else {
       // TODO: more types
       res = type.getAsString();
@@ -402,6 +456,13 @@ private:
 
   // See VisitUnaryAddrOf
   bool isAddrOf;
+
+  StringSet<> JuliaKeywordSet{
+      "baremodule", "begin", "break",    "catch",  "const",  "continue",
+      "do",         "else",  "elseif",   "end",    "export", "false",
+      "finally",    "for",   "function", "global", "if",     "import",
+      "let",        "local", "macro",    "module", "quote",  "return",
+      "struct",     "true",  "try",      "using",  "while"};
 };
 
 // I must know in advance whether a local variable "leaks" by pointers. Instead
