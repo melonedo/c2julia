@@ -77,8 +77,7 @@ public:
     for (auto p : d->parameters()) {
       if (!inRefSet(p))
         continue;
-      outs() << getEscapedName(p) << " = Ref{";
-      outs() << getTypeName(p->getType()) << "}(";
+      outs() << getEscapedName(p) << " = Ref(";
       outs() << getEscapedName(p) << ")\n";
     }
 
@@ -97,10 +96,7 @@ public:
     // The case where a CompoundStmt is actually just a container will be
     // handled explicitly in respective methods for its parent type.
     outs() << "let\n";
-    for (const Stmt *c : s->children()) {
-      Visit(c);
-      outs() << "\n";
-    }
+    VisitCompoundNoLet(s);
     outs() << "end";
   }
 
@@ -114,9 +110,9 @@ public:
     if (inRefSet(d)) {
       outs() << getEscapedName(d) << " = Ref{";
       outs() << getTypeName(d->getType());
-      outs() << "}()\n";
+      outs() << "}()";
       if (d->hasInit()) {
-        outs() << getEscapedName(d) << "[] = ";
+        outs() << "\n" << getEscapedName(d) << "[] = ";
         Visit(d->getInit());
       }
     } else {
@@ -317,10 +313,7 @@ public:
     outs() << "if ";
     Visit(s->getCond());
     outs() << "\n";
-    for (const Stmt *c : s->getThen()->children()) {
-      Visit(c);
-      outs() << "\n";
-    }
+    VisitCompoundNoLet(s->getThen());
 
     const Stmt *elseclause = s->getElse();
     while (elseclause) {
@@ -328,17 +321,11 @@ public:
         outs() << "elseif ";
         Visit(nestedif->getCond());
         outs() << "\n";
-        for (const Stmt *c : nestedif->getThen()->children()) {
-          Visit(c);
-          outs() << "\n";
-        }
+        VisitCompoundNoLet(nestedif->getThen());
         elseclause = nestedif->getElse();
       } else {
         outs() << "else\n";
-        for (const Stmt *c : elseclause->children()) {
-          Visit(c);
-          outs() << "\n";
-        }
+        VisitCompoundNoLet(elseclause);
         break;
       }
     }
@@ -360,16 +347,7 @@ public:
     outs() << "while ";
     Visit(s->getCond());
     outs() << "\n";
-    auto *body = s->getBody();
-    if (isa<CompoundStmt>(body)) {
-      for (const Stmt *c : body->children()) {
-        Visit(c);
-        outs() << "\n";
-      }
-    } else {
-      Visit(body);
-      outs() << "\n";
-    }
+    VisitCompoundNoLet(s->getBody());
     outs() << "end";
   }
 
@@ -399,6 +377,20 @@ public:
   void Visit(const ASTContext *ctx) {
     for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
       Visit(d);
+      outs() << "\n";
+    }
+  }
+
+  // Visit a single statement, or multiple statements wrapped in a CompoundStmt.
+  // Like VisitCompoundStmt but does not add let ... end
+  void VisitCompoundNoLet(const Stmt *s) {
+    if (isa<CompoundStmt>(s)) {
+      for (const Stmt *c : s->children()) {
+        Visit(c);
+        outs() << "\n";
+      }
+    } else {
+      Visit(s);
       outs() << "\n";
     }
   }
@@ -462,7 +454,10 @@ private:
       "do",         "else",  "elseif",   "end",    "export", "false",
       "finally",    "for",   "function", "global", "if",     "import",
       "let",        "local", "macro",    "module", "quote",  "return",
-      "struct",     "true",  "try",      "using",  "while"};
+      "struct",     "true",  "try",      "using",  "while", 
+      // Not keywords, but julia functions
+      "Ref"
+      };
 };
 
 // I must know in advance whether a local variable "leaks" by pointers. Instead
