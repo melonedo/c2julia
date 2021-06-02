@@ -63,7 +63,7 @@ public:
     if (!isMainFile(d))
       return;
 
-    outs() << "function " << getEscapedName(d) << '(';
+    outs() << "@C function " << getEscapedName(d) << '(';
     bool first = true;
     for (auto p : d->parameters()) {
       if (!first)
@@ -116,11 +116,12 @@ public:
         Visit(d->getInit());
       }
     } else {
-      outs() << getEscapedName(d) << " = ";
+      outs() << getEscapedName(d) << "::";
+      outs() << getTypeName(d->getType()) << " = ";
       if (d->hasInit()) {
         Visit(d->getInit());
       } else {
-        outs() << "nothing";
+        outs() << "undef";
       }
     }
   }
@@ -133,19 +134,20 @@ public:
     case CK_LValueToRValue:
     case CK_NoOp:
     case CK_ArrayToPointerDecay:
+    case CK_IntegralCast:
       // Ignore
       break;
 
-    case CK_IntegralCast:
-      after = " % ";
-      after += getTypeName(e->getType());
-      break;
+      // after = " % ";
+      // after += getTypeName(e->getType());
+      // break;
 
     case CK_BitCast:
-      if (e->getType()->isPointerType()) {
-        outs() << getTypeName(e->getType()) << "(";
-        after = ")";
-      }
+      //! TODO: Work out the real rule here
+      // if (e->getType()->isPointerType() && !e->getType()->isVoidPointerType()) {
+      //   outs() << getTypeName(e->getType()) << "(";
+      //   after = ")";
+      // }
       break;
     default:
       errs() << "Unhandled cast kind: " << e->getCastKindName() << "\n";
@@ -310,7 +312,7 @@ public:
   }
 
   void VisitIfStmt(const IfStmt *s) {
-    outs() << "if ";
+    outs() << "if @bool ";
     Visit(s->getCond());
     outs() << "\n";
     VisitCompoundNoLet(s->getThen());
@@ -318,7 +320,7 @@ public:
     const Stmt *elseclause = s->getElse();
     while (elseclause) {
       if (auto *nestedif = dyn_cast<IfStmt>(elseclause)) {
-        outs() << "elseif ";
+        outs() << "elseif @bool ";
         Visit(nestedif->getCond());
         outs() << "\n";
         VisitCompoundNoLet(nestedif->getThen());
@@ -335,16 +337,16 @@ public:
   void VisitForStmt(const ForStmt *s) {
     outs() << "@cfor ";
     Visit(s->getInit());
-    outs() << " ";
+    outs() << " @bool(";
     Visit(s->getCond());
-    outs() << " ";
+    outs() << ") ";
     Visit(s->getInc());
     outs() << " ";
     Visit(s->getBody());
   }
 
   void VisitWhileStmt(const WhileStmt *s) {
-    outs() << "while ";
+    outs() << "while @bool ";
     Visit(s->getCond());
     outs() << "\n";
     VisitCompoundNoLet(s->getBody());
@@ -375,10 +377,12 @@ public:
   void VisitCStyleCastExpr(const CStyleCastExpr *e) { Visit(e->getSubExpr()); }
 
   void Visit(const ASTContext *ctx) {
+    outs() << "baremodule C\nusing C2Julia\n";
     for (Decl *d : Context->getTranslationUnitDecl()->decls()) {
       Visit(d);
       outs() << "\n";
     }
+    outs() << "end\n";
   }
 
   // Visit a single statement, or multiple statements wrapped in a CompoundStmt.
@@ -421,12 +425,13 @@ public:
 
     if (type->isIntegerType() && type->isBuiltinType()) {
       if (type->isUnsignedIntegerType()) {
-        res = "Cu";
-        res += type.getAsString().substr(sizeof("unsigned"));
+        res = type.getAsString();
+        res[sizeof("unsigned")-1] = '_';
       } else {
-        res = "C";
-        res += type.getAsString();
+        res = type.getAsString();
       }
+    } else if (type->isVoidPointerType()) {
+      res = "Any";
     } else if (type->isPointerType()) {
       res = "Pointer{";
       res += getTypeName(type->getPointeeType());
@@ -450,14 +455,12 @@ private:
   bool isAddrOf;
 
   StringSet<> JuliaKeywordSet{
-      "baremodule", "begin", "break",    "catch",  "const",  "continue",
-      "do",         "else",  "elseif",   "end",    "export", "false",
-      "finally",    "for",   "function", "global", "if",     "import",
-      "let",        "local", "macro",    "module", "quote",  "return",
-      "struct",     "true",  "try",      "using",  "while", 
+      "baremodule", "begin", "break", "catch", "const", "continue", "do",
+      "else", "elseif", "end", "export", "false", "finally", "for", "function",
+      "global", "if", "import", "let", "local", "macro", "module", "quote",
+      "return", "struct", "true", "try", "using", "while",
       // Not keywords, but julia functions
-      "Ref"
-      };
+      "Ref", "ref"};
 };
 
 // I must know in advance whether a local variable "leaks" by pointers. Instead
